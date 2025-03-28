@@ -7,6 +7,7 @@ venv/
 
 # src 내부에서 무시할 항목
 src/test/
+src/utils
 
 # 개별 파일 무시
 calibration_data.npz
