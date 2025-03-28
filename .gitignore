@@ -1,0 +1,19 @@
+# 루트 디렉토리 무시
+calibration/
+image/
+poses/
+sequences/
+venv/
+
+# src 내부에서 무시할 항목
+src/test/
+
+# 개별 파일 무시
+calibration_data.npz
+
+# 기타 일반적인 무시 대상
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.DS_Store
