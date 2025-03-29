@@ -1,19 +1,17 @@
 import cv2
 import numpy as np
 import os
-import math
-
 
 FOCAL = 718.856  # 초점 거리
 PP = (607.1928, 185.2157)  # 주점 (cx, cy)
 
 MAX_FRAME = 2000
 
-SEQ = 0
+SEQ = 5
 
-IMAGE_FORDER_PATH = f"../../sequences/{SEQ:02}/image_0/"
-POSES_PATH = f"../../poses/{SEQ:02}.txt"
-PARAM_PATH = f"../../calibration/{SEQ:02}/calib.txt"
+PATH_SEQUENCES = f"../../sequences/{SEQ:02}/image_0/"
+PATH_GROUND_TRUTH = f"../../ground_truth/{SEQ:02}.txt"
+PATH_SENSOR_INFO = f"../../sensor_info/{SEQ:02}/calib.txt"
 
 orb = cv2.ORB_create(
     nfeatures=5000,
@@ -26,84 +24,77 @@ orb = cv2.ORB_create(
     patchSize=31,
     fastThreshold=25,
 )
-# bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-bf = cv2.BFMatcher(cv2.NORM_HAMMING2)
+bf = cv2.BFMatcher(cv2.NORM_HAMMING)
 
 
-def apply_orb(frame):
+def detect_keypoints(frame):
     keyPoints, descriptors = orb.detectAndCompute(frame, None)
 
     return keyPoints, descriptors
 
 
-def feature_matching(prev_descriptors, curr_descriptors):
+def get_matches(prev_descriptors, curr_descriptors):
     matches = bf.knnMatch(prev_descriptors, curr_descriptors, k=2)
-    # matches = bf.match(prev_descriptors, curr_descriptors)
 
-    # matches = sorted(matches, key=lambda x: x.distance)
-    good_matches = []
-    for m, n in matches:
-        if m.distance < 0.75 * n.distance:
-            good_matches.append(m)
+    good_matches = [m for m, n in matches if m.distance < 0.75 * n.distance]
 
     return good_matches[:1500]
 
 
-def essent_and_recover(curr_points, prev_points):
+def adjust_pose(R, t):
+    F = np.diag([1, 1, -1])
+    t_adj = F @ t
+    R_adj = F @ R @ F
+
+    return R_adj, t_adj
+
+
+def estimate_pose(prev_points, curr_points):
     E, _ = cv2.findEssentialMat(
-        curr_points,
         prev_points,
+        curr_points,
         focal=FOCAL,
         pp=PP,
         method=cv2.RANSAC,
         prob=0.999,
         threshold=1.0,
     )
-    _, R, t, _ = cv2.recoverPose(E, curr_points, prev_points, focal=FOCAL, pp=PP)
+    _, R, t, _ = cv2.recoverPose(E, prev_points, curr_points, focal=FOCAL, pp=PP)
+    R, t = adjust_pose(R, t)
 
     return R, t
 
 
-def get_scale(frame_number, t_gt):
-    txt_pile = open(POSES_PATH)
+def get_scale(gt_data, frame_number, t_gt):
+    prev_x, prev_y, prev_z = t_gt.flatten()
+    x, y, z = [float(gt_data[frame_number].split()[i]) for i in [3, 7, 11]]
 
-    x_prev = float(t_gt[0])
-    y_prev = float(t_gt[1])
-    z_prev = float(t_gt[2])
-
-    line = txt_pile.readlines()
-    line_sp = line[frame_number].split(" ")
-
-    x = float(line_sp[3])
-    y = float(line_sp[7])
-    z = float(line_sp[11])
-
-    t_gt[0] = x
-    t_gt[1] = y
-    t_gt[2] = z
-
-    txt_pile.close()
-
-    scale = math.sqrt((x - x_prev) ** 2 + (y - y_prev) ** 2 + (z - z_prev) ** 2)
+    t_gt[:] = [[x], [y], [z]]
+    scale = np.linalg.norm([x - prev_x, y - prev_y, z - prev_z])
 
     return scale, t_gt
 
 
+def get_points_from_matches(kp1, kp2, matches):
+    pts1 = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 2)
+    pts2 = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 2)
+
+    return pts1, pts2
+
+
 def preprocessing():
-    img1 = cv2.imread(IMAGE_FORDER_PATH + "000000.png", cv2.IMREAD_GRAYSCALE)
-    img2 = cv2.imread(IMAGE_FORDER_PATH + "000001.png", cv2.IMREAD_GRAYSCALE)
+    img1 = cv2.imread(PATH_SEQUENCES + "000000.png", cv2.IMREAD_GRAYSCALE)
+    img2 = cv2.imread(PATH_SEQUENCES + "000001.png", cv2.IMREAD_GRAYSCALE)
 
-    kp1, des1 = apply_orb(img1)
-    kp2, des2 = apply_orb(img2)
+    kp1, des1 = detect_keypoints(img1)
+    kp2, des2 = detect_keypoints(img2)
 
-    matches = feature_matching(des1, des2)
+    matches = get_matches(des1, des2)
 
     # draw_feature_matches(img1, kp1, img2, kp2, matches)
+    pts1, pts2 = get_points_from_matches(kp1, kp2, matches)
 
-    pts1 = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-    pts2 = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
-
-    R_p, t_p = essent_and_recover(pts2, pts1)
+    R_p, t_p = estimate_pose(pts1, pts2)
 
     return img2, kp2, des2, R_p, t_p
 
@@ -127,23 +118,44 @@ def draw_keypoints(frame, curr_keyPoints):
     cv2.imshow("Monocular Visual Odometry with Keypoints", frame_with_kp)
 
 
-def draw_odom(viewer, t_gt, t_p):
-    height = viewer.shape[0]
-    width = viewer.shape[1]
+def draw_trajectory(viewer, t_gt, t_p):
+    center_height = viewer.shape[0] // 2
+    center_width = viewer.shape[1] // 2
 
-    x_gt = int(t_gt[0]) + height // 2
-    y_gt = int(t_gt[2]) + width // 2
+    x = center_width + int(t_p[0].item())
+    z = center_height - int(t_p[2].item())
 
-    x = int(t_p[0]) + height // 2
-    y = int(t_p[2]) + width // 2
+    x_gt = center_width + int(t_gt[0].item())
+    z_gt = center_height - int(t_gt[2].item())
 
-    cv2.circle(viewer, (x, y), 1, (0, 0, 255), 2)
-    cv2.circle(viewer, (x_gt, y_gt), 1, (255, 0, 0), 2)
+    cv2.circle(viewer, (x, z), 1, (0, 0, 255), 2)
+    cv2.circle(viewer, (x_gt, z_gt), 1, (255, 0, 0), 2)
 
-    cv2.imshow("trajectory", viewer)
+    cv2.imshow("Trajectory", viewer)
+
+
+def load_sensor_param():
+    with open(PATH_SENSOR_INFO, "r") as f:
+        line = f.readline()
+        param = np.array(list((map(float, line.split()[1:])))).reshape((3, 4))
+
+        focal = param[0, 0]
+        pp = (param[0, 2], param[1, 2])
+
+        return focal, pp
 
 
 def main():
+    global FOCAL
+    global PP
+
+    FOCAL, PP = load_sensor_param()
+
+    print(FOCAL, PP)
+
+    with open(PATH_GROUND_TRUTH, "r") as f:
+        gt_data = f.readlines()
+
     img2, kp2, des2, R_p, t_p = preprocessing()
     prev_frame = img2
     prev_keyPoints = kp2
@@ -169,27 +181,24 @@ def main():
 
     for frame_number in range(2, MAX_FRAME):
         frame = cv2.imread(
-            os.path.join(IMAGE_FORDER_PATH, f"{frame_number:06}.png"),
+            PATH_SEQUENCES + f"{frame_number:06}.png",
             cv2.IMREAD_GRAYSCALE,
         )
 
-        curr_keyPoints, curr_descriptors = apply_orb(frame)
+        curr_keyPoints, curr_descriptors = detect_keypoints(frame)
 
-        matches = feature_matching(prev_descriptors, curr_descriptors)
+        matches = get_matches(prev_descriptors, curr_descriptors)
 
-        prev_points = np.float32(
-            [prev_keyPoints[m.queryIdx].pt for m in matches]
-        ).reshape(-1, 1, 2)
-        curr_points = np.float32(
-            [curr_keyPoints[m.trainIdx].pt for m in matches]
-        ).reshape(-1, 1, 2)
+        prev_points, curr_points = get_points_from_matches(
+            prev_keyPoints, curr_keyPoints, matches
+        )
 
-        R, t = essent_and_recover(curr_points, prev_points)
+        R, t = estimate_pose(prev_points, curr_points)
 
-        abs_scale, t_gt = get_scale(frame_number, t_gt)
+        scale, t_gt = get_scale(gt_data, frame_number, t_gt)
 
         # 이동벡터, 회전행렬 누적
-        t_p = t_p + abs_scale * R_p @ t
+        t_p = t_p + scale * R_p @ t
         R_p = R @ R_p
 
         cv2.putText(
@@ -203,7 +212,7 @@ def main():
         )
 
         # Imshow
-        draw_odom(viewer, t_gt, t_p)
+        draw_trajectory(viewer, t_gt, t_p)
         # draw_feature_matches(prev_frame, prev_keyPoints, frame, curr_keyPoints, matches)
         # draw_keypoints(frame, curr_keyPoints)
         cv2.imshow("original frame", frame)
@@ -216,7 +225,7 @@ def main():
             break
     cv2.destroyAllWindows()
 
-    draw_odom(viewer, t_gt, t_p)
+    draw_trajectory(viewer, t_gt, t_p)
     cv2.waitKey()
 
     cv2.destroyAllWindows()
